@@ -107,10 +107,12 @@ func (ps Params) ByName(name string) string {
 	return ""
 }
 
+type verbhandler map[string]Handle
+
 // Router is a http.Handler which can be used to dispatch requests to different
 // handler functions via configurable routes
 type Router struct {
-	trees map[string]*node
+	tree *node
 
 	// Enables automatic redirection if the current route can't be matched but a
 	// handler for the path with (without) the trailing slash exists.
@@ -211,17 +213,11 @@ func (r *Router) Handle(method, path string, handle Handle) {
 		panic("path must begin with '/'")
 	}
 
-	if r.trees == nil {
-		r.trees = make(map[string]*node)
+	if r.tree == nil {
+		r.tree = new(node)
 	}
 
-	root := r.trees[method]
-	if root == nil {
-		root = new(node)
-		r.trees[method] = root
-	}
-
-	root.addRoute(path, handle)
+	r.tree.addRoute(path, method, handle)
 }
 
 // Handler is an adapter which allows the usage of an http.Handler as a
@@ -275,10 +271,17 @@ func (r *Router) recv(w http.ResponseWriter, req *http.Request) {
 // values. Otherwise the third return value indicates whether a redirection to
 // the same path with an extra / without the trailing slash should be performed.
 func (r *Router) Lookup(method, path string) (Handle, Params, bool) {
-	if root := r.trees[method]; root != nil {
-		return root.getValue(path)
+	if r.tree == nil {
+		return nil, nil, false
 	}
-	return nil, nil, false
+
+	v, ps, b := r.tree.getValue(path)
+
+	if v != nil {
+		return v[method], ps, b
+	}
+
+	return nil, ps, b
 }
 
 // ServeHTTP makes the router implement the http.Handler interface.
@@ -287,65 +290,59 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		defer r.recv(w, req)
 	}
 
-	if root := r.trees[req.Method]; root != nil {
-		path := req.URL.Path
+	path := req.URL.Path
+	verb, ps, tsr := r.tree.getValue(path)
+	handle := verb[req.Method]
 
-		if handle, ps, tsr := root.getValue(path); handle != nil {
+	if verb != nil {
+		if handle != nil {
 			handle(w, req, ps)
 			return
-		} else if req.Method != "CONNECT" && path != "/" {
-			code := 301 // Permanent redirect, request with GET method
-			if req.Method != "GET" {
-				// Temporary redirect, request with same method
-				// As of Go 1.3, Go does not support status code 308.
-				code = 307
-			}
+		}
+	} else if req.Method != "CONNECT" && path != "/" {
+		code := 301 // Permanent redirect, request with GET method
+		if req.Method != "GET" {
+			// Temporary redirect, request with same method
+			// As of Go 1.3, Go does not support status code 308.
+			code = 307
+		}
 
-			if tsr && r.RedirectTrailingSlash {
-				if len(path) > 1 && path[len(path)-1] == '/' {
-					req.URL.Path = path[:len(path)-1]
-				} else {
-					req.URL.Path = path + "/"
-				}
+		if tsr && r.RedirectTrailingSlash {
+			if len(path) > 1 && path[len(path)-1] == '/' {
+				req.URL.Path = path[:len(path)-1]
+			} else {
+				req.URL.Path = path + "/"
+			}
+			http.Redirect(w, req, req.URL.String(), code)
+			return
+		}
+
+		// Try to fix the request path
+		if r.RedirectFixedPath {
+			fixedPath, found := r.tree.findCaseInsensitivePath(
+				CleanPath(path),
+				r.RedirectTrailingSlash,
+			)
+			if found {
+				req.URL.Path = string(fixedPath)
 				http.Redirect(w, req, req.URL.String(), code)
 				return
-			}
-
-			// Try to fix the request path
-			if r.RedirectFixedPath {
-				fixedPath, found := root.findCaseInsensitivePath(
-					CleanPath(path),
-					r.RedirectTrailingSlash,
-				)
-				if found {
-					req.URL.Path = string(fixedPath)
-					http.Redirect(w, req, req.URL.String(), code)
-					return
-				}
 			}
 		}
 	}
 
 	// Handle 405
 	if r.HandleMethodNotAllowed {
-		for method := range r.trees {
-			// Skip the requested method - we already tried this one
-			if method == req.Method {
-				continue
+		if verb != nil && handle == nil {
+			if r.MethodNotAllowed != nil {
+				r.MethodNotAllowed(w, req)
+			} else {
+				http.Error(w,
+					http.StatusText(http.StatusMethodNotAllowed),
+					http.StatusMethodNotAllowed,
+				)
 			}
-
-			handle, _, _ := r.trees[method].getValue(req.URL.Path)
-			if handle != nil {
-				if r.MethodNotAllowed != nil {
-					r.MethodNotAllowed(w, req)
-				} else {
-					http.Error(w,
-						http.StatusText(http.StatusMethodNotAllowed),
-						http.StatusMethodNotAllowed,
-					)
-				}
-				return
-			}
+			return
 		}
 	}
 

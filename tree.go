@@ -45,7 +45,7 @@ type node struct {
 	maxParams uint8
 	indices   string
 	children  []*node
-	handle    Handle
+	verb      verbhandler
 	priority  uint32
 }
 
@@ -75,9 +75,9 @@ func (n *node) incrementChildPrio(pos int) int {
 	return newPos
 }
 
-// addRoute adds a node with the given handle to the path.
+// addRoute adds a node with the given method and handle to the path.
 // Not concurrency-safe!
-func (n *node) addRoute(path string, handle Handle) {
+func (n *node) addRoute(path, method string, handle Handle) {
 	n.priority++
 	numParams := countParams(path)
 
@@ -106,7 +106,7 @@ func (n *node) addRoute(path string, handle Handle) {
 					wildChild: n.wildChild,
 					indices:   n.indices,
 					children:  n.children,
-					handle:    n.handle,
+					verb:      n.verb,
 					priority:  n.priority - 1,
 				}
 
@@ -120,7 +120,7 @@ func (n *node) addRoute(path string, handle Handle) {
 				n.children = []*node{&child}
 				n.indices = string(n.path[i])
 				n.path = path[:i]
-				n.handle = nil
+				n.verb = nil
 				n.wildChild = false
 			}
 
@@ -177,23 +177,25 @@ func (n *node) addRoute(path string, handle Handle) {
 					n.incrementChildPrio(len(n.indices) - 1)
 					n = child
 				}
-				n.insertChild(numParams, path, handle)
+				n.insertChild(numParams, path, method, handle)
 				return
 
 			} else if i == len(path) { // Make node a (in-path) leaf
-				if n.handle != nil {
+				if n.verb == nil {
+					n.verb = make(verbhandler)
+				} else if n.verb[method] != nil {
 					panic("a Handle is already registered for this path")
 				}
-				n.handle = handle
+				n.verb[method] = handle
 			}
 			return
 		}
 	} else { // Empty tree
-		n.insertChild(numParams, path, handle)
+		n.insertChild(numParams, path, method, handle)
 	}
 }
 
-func (n *node) insertChild(numParams uint8, path string, handle Handle) {
+func (n *node) insertChild(numParams uint8, path string, method string, handle Handle) {
 	var offset int // already handled bytes of the path
 
 	// find prefix until first wildcard (beginning with ':'' or '*'')
@@ -285,12 +287,15 @@ func (n *node) insertChild(numParams uint8, path string, handle Handle) {
 			n = child
 			n.priority++
 
+			verb := make(verbhandler)
+			verb[method] = handle
+
 			// second node: node holding the variable
 			child = &node{
 				path:      path[i:],
 				nType:     catchAll,
 				maxParams: 1,
-				handle:    handle,
+				verb:      verb,
 				priority:  1,
 			}
 			n.children = []*node{child}
@@ -301,7 +306,10 @@ func (n *node) insertChild(numParams uint8, path string, handle Handle) {
 
 	// insert remaining path part and handle to the leaf
 	n.path = path[offset:]
-	n.handle = handle
+	if n.verb == nil {
+		n.verb = make(verbhandler)
+	}
+	n.verb[method] = handle
 }
 
 // Returns the handle registered with the given path (key). The values of
@@ -309,7 +317,7 @@ func (n *node) insertChild(numParams uint8, path string, handle Handle) {
 // If no handle can be found, a TSR (trailing slash redirect) recommendation is
 // made if a handle exists with an extra (without the) trailing slash for the
 // given path.
-func (n *node) getValue(path string) (handle Handle, p Params, tsr bool) {
+func (n *node) getValue(path string) (verb verbhandler, p Params, tsr bool) {
 walk: // Outer loop for walking the tree
 	for {
 		if len(path) > len(n.path) {
@@ -330,7 +338,7 @@ walk: // Outer loop for walking the tree
 					// Nothing found.
 					// We can recommend to redirect to the same URL without a
 					// trailing slash if a leaf exists for that path.
-					tsr = (path == "/" && n.handle != nil)
+					tsr = (path == "/" && n.verb != nil)
 					return
 
 				}
@@ -368,13 +376,13 @@ walk: // Outer loop for walking the tree
 						return
 					}
 
-					if handle = n.handle; handle != nil {
+					if verb = n.verb; verb != nil {
 						return
 					} else if len(n.children) == 1 {
 						// No handle found. Check if a handle for this path + a
 						// trailing slash exists for TSR recommendation
 						n = n.children[0]
-						tsr = (n.path == "/" && n.handle != nil)
+						tsr = (n.path == "/" && n.verb != nil)
 					}
 
 					return
@@ -390,7 +398,7 @@ walk: // Outer loop for walking the tree
 					p[i].Key = n.path[2:]
 					p[i].Value = path
 
-					handle = n.handle
+					verb = n.verb
 					return
 
 				default:
@@ -398,19 +406,19 @@ walk: // Outer loop for walking the tree
 				}
 			}
 		} else if path == n.path {
-			// We should have reached the node containing the handle.
-			// Check if this node has a handle registered.
-			if handle = n.handle; handle != nil {
+			// We should have reached the node containing the verb.
+			// Check if this node has a verb registered.
+			if verb = n.verb; verb != nil {
 				return
 			}
 
-			// No handle found. Check if a handle for this path + a
+			// No verb found. Check if a verb for this path + a
 			// trailing slash exists for trailing slash recommendation
 			for i := 0; i < len(n.indices); i++ {
 				if n.indices[i] == '/' {
 					n = n.children[i]
-					tsr = (len(n.path) == 1 && n.handle != nil) ||
-						(n.nType == catchAll && n.children[0].handle != nil)
+					tsr = (len(n.path) == 1 && n.verb != nil) ||
+						(n.nType == catchAll && n.children[0].verb != nil)
 					return
 				}
 			}
@@ -422,7 +430,7 @@ walk: // Outer loop for walking the tree
 		// extra trailing slash if a leaf exists for that path
 		tsr = (path == "/") ||
 			(len(n.path) == len(path)+1 && n.path[len(path)] == '/' &&
-				path == n.path[:len(n.path)-1] && n.handle != nil)
+				path == n.path[:len(n.path)-1] && n.verb != nil)
 		return
 	}
 }
@@ -458,7 +466,7 @@ func (n *node) findCaseInsensitivePath(path string, fixTrailingSlash bool) (ciPa
 
 				// Nothing found. We can recommend to redirect to the same URL
 				// without a trailing slash if a leaf exists for that path
-				found = (fixTrailingSlash && path == "/" && n.handle != nil)
+				found = (fixTrailingSlash && path == "/" && n.verb != nil)
 				return
 			}
 
@@ -489,13 +497,13 @@ func (n *node) findCaseInsensitivePath(path string, fixTrailingSlash bool) (ciPa
 					return
 				}
 
-				if n.handle != nil {
+				if n.verb != nil {
 					return ciPath, true
 				} else if fixTrailingSlash && len(n.children) == 1 {
-					// No handle found. Check if a handle for this path + a
+					// No verb found. Check if a verb for this path + a
 					// trailing slash exists
 					n = n.children[0]
-					if n.path == "/" && n.handle != nil {
+					if n.path == "/" && n.verb != nil {
 						return append(ciPath, '/'), true
 					}
 				}
@@ -508,20 +516,20 @@ func (n *node) findCaseInsensitivePath(path string, fixTrailingSlash bool) (ciPa
 				panic("Invalid node type")
 			}
 		} else {
-			// We should have reached the node containing the handle.
-			// Check if this node has a handle registered.
-			if n.handle != nil {
+			// We should have reached the node containing the verb.
+			// Check if this node has a verb registered.
+			if n.verb != nil {
 				return ciPath, true
 			}
 
-			// No handle found.
+			// No verb found.
 			// Try to fix the path by adding a trailing slash
 			if fixTrailingSlash {
 				for i := 0; i < len(n.indices); i++ {
 					if n.indices[i] == '/' {
 						n = n.children[i]
-						if (len(n.path) == 1 && n.handle != nil) ||
-							(n.nType == catchAll && n.children[0].handle != nil) {
+						if (len(n.path) == 1 && n.verb != nil) ||
+							(n.nType == catchAll && n.children[0].verb != nil) {
 							return append(ciPath, '/'), true
 						}
 						return
@@ -540,7 +548,7 @@ func (n *node) findCaseInsensitivePath(path string, fixTrailingSlash bool) (ciPa
 		}
 		if len(path)+1 == len(n.path) && n.path[len(path)] == '/' &&
 			strings.ToLower(path) == strings.ToLower(n.path[:len(path)]) &&
-			n.handle != nil {
+			n.verb != nil {
 			return append(ciPath, n.path...), true
 		}
 	}
